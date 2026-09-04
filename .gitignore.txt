@@ -1,0 +1,4 @@
+node_modules/
+.env
+nyx_bot_database.db
+*.db
