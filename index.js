@@ -10,6 +10,8 @@ db.prepare(`
         user_id TEXT PRIMARY KEY,
         total_messages INTEGER DEFAULT 0,
         salon_messages INTEGER DEFAULT 0,
+        vocal_minutes INTEGER DEFAULT 0,
+        events_count INTEGER DEFAULT 0,
         joined_at INTEGER
     )
 `).run();
@@ -25,7 +27,6 @@ db.prepare(`
     )
 `).run();
 
-// Table pour stocker les approbations des rôles (ex: user_id + role_id)
 db.prepare(`
     CREATE TABLE IF NOT EXISTS approvals (
         user_id TEXT,
@@ -35,7 +36,6 @@ db.prepare(`
     )
 `).run();
 
-// Table pour stocker les récompenses en attente des utilisateurs
 db.prepare(`
     CREATE TABLE IF NOT EXISTS rewards (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,24 +47,22 @@ db.prepare(`
 `).run();
 
 const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates]
 });
 
 const SALON_SPECIFIQUE_ID = "1431043862704689403";
 const TARGET_GUILD_ID = "1403173393691312138";
 const LOG_CHANNEL_REWARDS_ID = "1482503293778264106";
 
-// --- HIÉRARCHIE COMPLÈTE DES PALIERS DE RÔLES ---
+// --- HIÉRARCHIE COMPLÈTE DES PALIERS DE RÔLES (Mise à jour) ---
 const ROLES_CONFIG = [
-    { id: "1432349781937754123", name: "Membre Discord", reqMsg: 0, reqSalonMsg: 0, reqDays: 0 },
-    { id: "1430241400078860472", name: "Membre", reqMsg: 100, reqSalonMsg: 5, reqDays: 14 },
-    { id: "1482493008602599628", name: "Membre +", reqMsg: 500, reqSalonMsg: 25, reqDays: 21 },
-    { id: "1437857842580422728", name: "Vétéran", reqMsg: 2000, reqSalonMsg: 100, reqDays: 50 },
-    { id: "1403177299943100446", name: "Capitaine", reqMsg: 2000, reqSalonMsg: 100, reqDays: 50, approvalOnly: true },
-    { id: "148249284838840236", name: "Manager", reqMsg: 0, reqSalonMsg: 0, reqDays: 100, approvalOnly: true },
-    { id: "1403177420265357543", name: "Responsable", reqMsg: 0, reqSalonMsg: 0, reqDays: 150, approvalOnly: true },
-    { id: "1403177488200368288", name: "Directeur", reqMsg: 0, reqSalonMsg: 0, reqDays: 200, approvalOnly: true },
-    { id: "1403175431909408918", name: "Fondateur", reqMsg: 0, reqSalonMsg: 0, reqDays: 0, impossible: true }
+    { id: "1432349781937754123", name: "Membre Discord", reqMsg: 0, reqSalonMsg: 0, reqVocal: 0, reqEvents: 0 },
+    { id: "1430241400078860472", name: "Membre", reqMsg: 150, reqSalonMsg: 20, reqVocal: 120, reqEvents: 1 }, // 2H = 120 min
+    { id: "1482493008602599628", name: "Membre +", reqMsg: 500, reqSalonMsg: 50, reqVocal: 600, reqEvents: 3, approvalOnly: true, approvalRoleName: "Haut-Rang" }, // 10H = 600 min
+    { id: "1437857842580422728", name: "Vétéran", reqMsg: 1500, reqSalonMsg: 100, reqVocal: 1500, reqEvents: 5, approvalOnly: true, approvalRoleName: "Porte-Parole" }, // 25H = 1500 min
+    { id: "1403177299943100446", name: "Capitaine", reqMsg: 3000, reqSalonMsg: 150, reqVocal: 3000, reqEvents: 10, approvalOnly: true, approvalRoleName: "Directeur+" }, // 50H = 3000 min
+    { id: "148249284838840236", name: "Manager", reqMsg: 7500, reqSalonMsg: 300, reqVocal: 6000, reqEvents: 25, approvalOnly: true, approvalRoleName: "Fondateur" }, // 100H = 6000 min
+    { id: "1403177420265357543", name: "Responsable", reqMsg: 0, reqSalonMsg: 0, reqVocal: 0, reqEvents: 0, impossible: true }
 ];
 
 // --- CONFIGURATION DES SANCTIONS ---
@@ -74,16 +72,22 @@ const SANCTIONS_CONFIG = {
     "Dernière chance": { roleId: "1437167319465066546", days: null }
 };
 
+// Suivi du temps vocal en mémoire (pour incrémenter chaque minute)
+const vocalSessions = new Map();
+
 client.once(Events.ClientReady, async () => {
     console.log(`🤖 NYX DÉMARRÉ : ${client.user.tag}`);
     
     const commands = [
         new SlashCommandBuilder().setName("rank").setDescription("Affiche ta progression détaillée"),
-        new SlashCommandBuilder().setName("roles").setDescription("Liste des paliers de rôles"),
+        new SlashCommandBuilder().setName("roles").setDescription("Liste des paliers de rôles et conditions"),
         new SlashCommandBuilder().setName("recompenses").setDescription("Vérifie tes récompenses en attente"),
         new SlashCommandBuilder().setName("reward").setDescription("Donner une récompense à un membre")
             .addUserOption(o => o.setName("cible").setDescription("Membre à récompenser").setRequired(true))
             .addIntegerOption(o => o.setName("montant").setDescription("Montant de la récompense").setRequired(true))
+            .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+        new SlashCommandBuilder().setName("event-log").setDescription("Ajouter un événement validé à un membre")
+            .addUserOption(o => o.setName("cible").setDescription("Membre concerné").setRequired(true))
             .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
         new SlashCommandBuilder().setName("approbation").setDescription("Approuver l'accès au prochain rang pour un membre")
             .addUserOption(o => o.setName("cible").setDescription("Membre à approuver").setRequired(true))
@@ -111,6 +115,7 @@ client.once(Events.ClientReady, async () => {
     }
 });
 
+// --- TRACKING DES MESSAGES ---
 client.on(Events.MessageCreate, async message => {
     try {
         if (message.author.bot || !message.guild) return;
@@ -121,7 +126,7 @@ client.on(Events.MessageCreate, async message => {
 
         let user = db.prepare("SELECT * FROM users WHERE user_id = ?").get(userId);
         if (!user) {
-            db.prepare("INSERT INTO users (user_id, total_messages, salon_messages, joined_at) VALUES (?, 1, ?, ?)").run(userId, isSalon, joinedAt);
+            db.prepare("INSERT INTO users (user_id, total_messages, salon_messages, vocal_minutes, events_count, joined_at) VALUES (?, 1, ?, 0, 0, ?)").run(userId, isSalon, joinedAt);
         } else {
             db.prepare("UPDATE users SET total_messages = total_messages + 1, salon_messages = salon_messages + ? WHERE user_id = ?").run(isSalon, userId);
         }
@@ -129,6 +134,58 @@ client.on(Events.MessageCreate, async message => {
         console.error("Erreur MessageCreate :", e);
     }
 });
+
+// --- TRACKING DU TEMPS VOCAL ---
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+    const userId = newState.id;
+    if (newState.member?.user.bot) return;
+
+    // S'il rejoint un salon vocal (et n'y était pas avant ou venait d'un autre)
+    if (!oldState.channelId && newState.channelId) {
+        vocalSessions.set(userId, Date.now());
+    } 
+    // S'il quitte un salon vocal
+    else if (oldState.channelId && !newState.channelId) {
+        if (vocalSessions.has(userId)) {
+            const startTime = vocalSessions.get(userId);
+            const minutesElapsed = Math.floor((Date.now() - startTime) / (1000 * 60));
+            vocalSessions.delete(userId);
+
+            if (minutesElapsed > 0) {
+                let user = db.prepare("SELECT * FROM users WHERE user_id = ?").get(userId);
+                if (!user) {
+                    db.prepare("INSERT INTO users (user_id, total_messages, salon_messages, vocal_minutes, events_count, joined_at) VALUES (?, 0, 0, ?, 0, ?)").run(userId, minutesElapsed, Date.now());
+                } else {
+                    db.prepare("UPDATE users SET vocal_minutes = vocal_minutes + ? WHERE user_id = ?").run(minutesElapsed, userId);
+                }
+            }
+        }
+    }
+});
+
+// Boucle de fond pour comptabiliser le vocal en temps réel (toutes les minutes pour ceux qui restent connectés)
+setInterval(() => {
+    const now = Date.now();
+    for (const [userId, startTime] of vocalSessions.entries()) {
+        const minutesElapsed = Math.floor((now - startTime) / (1000 * 60));
+        if (minutesElapsed >= 1) {
+            vocalSessions.set(userId, now); // Reset du timer partiel
+            let user = db.prepare("SELECT * FROM users WHERE user_id = ?").get(userId);
+            if (!user) {
+                db.prepare("INSERT INTO users (user_id, total_messages, salon_messages, vocal_minutes, events_count, joined_at) VALUES (?, 0, 0, 1, 0, ?)").run(userId, now);
+            } else {
+                db.prepare("UPDATE users SET vocal_minutes = vocal_minutes + 1 WHERE user_id = ?").run(userId);
+            }
+        }
+    }
+}, 60000);
+
+function formatHours(minutes) {
+    const h = Math.floor(minutes / 60);
+    const m = minutes % 60;
+    if (h === 0) return `${m}m`;
+    return `${h}H${m > 0 ? " " + m + "m" : ""}`;
+}
 
 function createProgressBar(current, max) {
     if (max <= 0) return "🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 100%";
@@ -142,12 +199,10 @@ function createProgressBar(current, max) {
 
 client.on(Events.InteractionCreate, async interaction => {
     try {
-        // --- GESTION DES COMMANDES SLASH ---
         if (interaction.isChatInputCommand()) {
             if (interaction.commandName === "rank") {
                 const member = interaction.member;
-                let user = db.prepare("SELECT * FROM users WHERE user_id = ?").get(interaction.user.id) || { total_messages: 0, salon_messages: 0, joined_at: member.joinedTimestamp || Date.now() };
-                const daysInServer = Math.floor((Date.now() - (user.joined_at || member.joinedTimestamp)) / (1000 * 60 * 60 * 24));
+                let user = db.prepare("SELECT * FROM users WHERE user_id = ?").get(interaction.user.id) || { total_messages: 0, salon_messages: 0, vocal_minutes: 0, events_count: 0, joined_at: member.joinedTimestamp || Date.now() };
 
                 let currentIndex = 0;
                 for (let i = 0; i < ROLES_CONFIG.length; i++) {
@@ -158,40 +213,45 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 let currentRole = ROLES_CONFIG[currentIndex];
                 let nextRole = ROLES_CONFIG[currentIndex + 1] || null;
-
                 let nextRankText = nextRole ? `**${nextRole.name}**` : "Rang Maximum Atteint 🎉";
                 
-                let msgBar, salonBar, daysBar, msgReqInfo, salonReqInfo, daysReqInfo;
+                let msgBar, paBar, vocalBar, eventBar;
+                let msgInfo, paInfo, vocalInfo, eventInfo;
 
                 if (nextRole) {
                     msgBar = createProgressBar(user.total_messages, nextRole.reqMsg);
-                    salonBar = createProgressBar(user.salon_messages, nextRole.reqSalonMsg);
-                    daysBar = createProgressBar(daysInServer, nextRole.reqDays);
-                    msgReqInfo = `(${user.total_messages} / ${nextRole.reqMsg})`;
-                    salonReqInfo = `(${user.salon_messages} / ${nextRole.reqSalonMsg})`;
-                    daysReqInfo = `(${daysInServer} / ${nextRole.reqDays} jours)`;
+                    paBar = createProgressBar(user.salon_messages, nextRole.reqSalonMsg);
+                    vocalBar = createProgressBar(user.vocal_minutes, nextRole.reqVocal);
+                    eventBar = createProgressBar(user.events_count, nextRole.reqEvents);
+
+                    msgInfo = `(${user.total_messages} / ${nextRole.reqMsg})`;
+                    paInfo = `(${user.salon_messages} / ${nextRole.reqSalonMsg})`;
+                    vocalInfo = `(${formatHours(user.vocal_minutes)} / ${formatHours(nextRole.reqVocal)})`;
+                    eventInfo = `(${user.events_count} / ${nextRole.reqEvents})`;
                 } else {
                     msgBar = "🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 100%";
-                    salonBar = "🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 100%";
-                    daysBar = "🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 100%";
-                    msgReqInfo = `(${user.total_messages})`;
-                    salonReqInfo = `(${user.salon_messages})`;
-                    daysReqInfo = `(${daysInServer} jours)`;
+                    paBar = "🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 100%";
+                    vocalBar = "🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 100%";
+                    eventBar = "🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 100%";
+                    msgInfo = `(${user.total_messages})`;
+                    paInfo = `(${user.salon_messages})`;
+                    vocalInfo = `(${formatHours(user.vocal_minutes)})`;
+                    eventInfo = `(${user.events_count})`;
                 }
 
                 const fields = [
                     { name: "👑 Rôle Actuel", value: `<@&${currentRole.id}>`, inline: true },
-                    { name: "⏳ Ancienneté", value: `${daysInServer} jours`, inline: true },
-                    { name: "🎯 Prochain Rang", value: nextRankText, inline: false },
-                    { name: `💬 Messages Globaux ${msgReqInfo}`, value: msgBar, inline: false },
-                    { name: `🔍 Preuve d'activité ${salonReqInfo}`, value: salonBar, inline: false },
-                    { name: `📅 Ancienneté requise ${daysReqInfo}`, value: daysBar, inline: false }
+                    { name: "🎯 Prochain Rang", value: nextRankText, inline: true },
+                    { name: `💬 Messages Globaux ${msgInfo}`, value: msgBar, inline: false },
+                    { name: `📁 Preuve d'Activité (PA) ${paInfo}`, value: paBar, inline: false },
+                    { name: `🎙️ Temps Vocal ${vocalInfo}`, value: vocalBar, inline: false },
+                    { name: `🏆 Événements ${eventInfo}`, value: eventBar, inline: false }
                 ];
 
                 if (nextRole && nextRole.approvalOnly) {
                     const approvalCheck = db.prepare("SELECT * FROM approvals WHERE user_id = ? AND role_id = ?").get(interaction.user.id, nextRole.id);
-                    const approvalStatus = approvalCheck ? "✅ Approuvé par un Admin" : "⏳ En attente d'approbation Admin";
-                    fields.push({ name: "🛡️ Statut d'approbation", value: approvalStatus, inline: false });
+                    const approvalStatus = approvalCheck ? "✅ Validé" : `⏳ En attente (Validation : ${nextRole.approvalRoleName})`;
+                    fields.push({ name: "🛡️ Statut d'Approbation", value: approvalStatus, inline: false });
                 }
 
                 const embed = new EmbedBuilder()
@@ -204,21 +264,34 @@ client.on(Events.InteractionCreate, async interaction => {
 
             if (interaction.commandName === "roles") {
                 const embed = new EmbedBuilder()
-                    .setTitle("📜 Liste des Paliers de Rôles")
+                    .setTitle("📜 Paliers de Rôles & Conditions")
                     .setColor("#2B2D31")
-                    .setDescription("Voici les différents rangs et leurs conditions d'obtention :");
+                    .setDescription("Voici les prérequis nécessaires pour chaque rang :");
 
                 ROLES_CONFIG.forEach(r => {
                     if (!r.impossible) {
                         embed.addFields({
                             name: r.name,
-                            value: `💬 ${r.reqMsg} msgs | 🔍 ${r.reqSalonMsg} salon | ⏳ ${r.reqDays} jours${r.approvalOnly ? " *(Validation Admin requise)*" : ""}`,
+                            value: `💬 ${r.reqMsg} msgs | 📁 ${r.reqSalonMsg} PA | 🎙️ ${Math.floor(r.reqVocal / 60)}H vocal | 🏆 ${r.reqEvents} evt${r.approvalOnly ? `\n🛡️ Approbation requise : **${r.approvalRoleName}**` : ""}`,
                             inline: false
                         });
                     }
                 });
 
                 return await interaction.reply({ embeds: [embed], flags: 64 });
+            }
+
+            if (interaction.commandName === "event-log") {
+                const target = interaction.options.getUser("cible");
+                let user = db.prepare("SELECT * FROM users WHERE user_id = ?").get(target.id);
+                
+                if (!user) {
+                    db.prepare("INSERT INTO users (user_id, total_messages, salon_messages, vocal_minutes, events_count, joined_at) VALUES (?, 0, 0, 0, 1, ?)").run(target.id, Date.now());
+                } else {
+                    db.prepare("UPDATE users SET events_count = events_count + 1 WHERE user_id = ?").run(target.id);
+                }
+
+                return await interaction.reply({ content: `✅ Événement validé et ajouté avec succès pour <@${target.id}> (+1 point événement).`, flags: 64 });
             }
 
             if (interaction.commandName === "recompenses") {
@@ -387,11 +460,13 @@ client.on(Events.InteractionCreate, async interaction => {
             }
 
             if (interaction.customId === "claim_specific_reward") {
+                await interaction.deferUpdate().catch(() => {});
+
                 const rewardId = interaction.values[0];
                 const reward = db.prepare("SELECT * FROM rewards WHERE id = ? AND user_id = ?").get(rewardId, interaction.user.id);
 
                 if (!reward) {
-                    return await interaction.update({ content: "❌ Cette récompense n'existe plus ou ne vous appartient plus.", embeds: [], components: [] });
+                    return await interaction.followUp({ content: "❌ Cette récompense n'existe plus ou ne vous appartient plus.", flags: 64 });
                 }
 
                 const modal = new ModalBuilder()
